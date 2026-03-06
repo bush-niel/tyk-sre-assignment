@@ -87,3 +87,15 @@ That makes it possible to:
 
 # How to test the application
 [Docs with examples ](docs/examples/README.md)
+
+# Helm related docs
+[Helm setup readme](helm/README.md)
+
+# Some future improvements that can be considered
+
+- The current API is intentionally simple, but it is not authenticated. In a real cluster, this should sit behind authn/authz or internal-only network access.
+
+- The deployment health endpoint in production should also expose Prometheus metrics so alerts and dashboards can use it.
+
+- Converting to a controller will reconcile the network policies if altered
+
