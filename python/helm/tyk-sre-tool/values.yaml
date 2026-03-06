@@ -3,7 +3,7 @@ replicaCount: 2
 image:
   repository: tyk-sre-tool
   tag: local
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 service:
   type: ClusterIP
