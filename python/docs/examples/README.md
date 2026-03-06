@@ -2,7 +2,6 @@
 
 ## 1. Create a Minikube cluster with Calico
 
-On Apple Silicon, Docker images should usually be built for `linux/arm64` for local testing.
 
 ```bash
 minikube start --cni=calico
