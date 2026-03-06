@@ -1,240 +1,175 @@
 import json
+import re
 import socketserver
-import threading
-from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
 
 from kubernetes import client
-from kubernetes.client.rest import ApiException
 
-
-# Calico CRD details for this cluster
+APP_NAME = "tyk-sre-tool"
+APP_VERSION = "1.0.0"
 CALICO_GROUP = "crd.projectcalico.org"
 CALICO_VERSION = "v1"
 CALICO_PLURAL = "networkpolicies"
-CALICO_KIND = "NetworkPolicy"
+MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
+MANAGED_BY_VALUE = APP_NAME
+BLOCK_GROUP_LABEL = "tyk.io/block-group"
 
-# Used to identify policies created by this tool
-MANAGED_BY_LABEL_KEY = "managed-by"
-MANAGED_BY_LABEL_VALUE = "tyk-sre-tool"
-BLOCK_NAME_LABEL_KEY = "block-name"
+API_CLIENT = None
 
-# This helps /readyz fail during shutdown
-SHUTTING_DOWN = False
+
+def configure_kubernetes(api_client: client.ApiClient):
+    """Store a configured Kubernetes API client for request handlers."""
+    global API_CLIENT
+    API_CLIENT = api_client
 
 
 class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        """Handle incoming GET requests."""
+        """Handle GET endpoints."""
         parsed = urlparse(self.path)
 
         if parsed.path == "/healthz":
-            self.healthz()
-        elif parsed.path == "/readyz":
-            self.readyz()
-        elif parsed.path == "/deployments/health":
-            self.deployments_health()
-        elif parsed.path == "/networkpolicies":
-            self.list_network_policies(parsed.query)
-        else:
-            self.send_error(404)
+            self.respond_text(200, "ok")
+            return
+
+        if parsed.path == "/readyz":
+            self.handle_readyz()
+            return
+
+        if parsed.path == "/deployments/health":
+            self.handle_deployments_health()
+            return
+
+        if parsed.path == "/networkpolicies":
+            params = parse_qs(parsed.query)
+            managed_only = params.get("managed_only", ["false"])[0].lower() == "true"
+            self.handle_list_network_policies(managed_only)
+            return
+
+        self.send_error(404)
 
     def do_POST(self):
-        """Handle incoming POST requests."""
+        """Handle POST endpoints."""
         parsed = urlparse(self.path)
 
         if parsed.path == "/networkpolicies":
-            self.create_network_policies()
-        else:
-            self.send_error(404)
+            self.handle_create_network_policy()
+            return
+
+        self.send_error(404)
 
     def do_DELETE(self):
-        """Handle incoming DELETE requests."""
+        """Handle DELETE endpoints."""
         parsed = urlparse(self.path)
 
         if parsed.path.startswith("/networkpolicies/"):
-            block_name = parsed.path.rsplit("/", 1)[-1]
-            self.delete_network_policies(block_name)
-        else:
-            self.send_error(404)
-
-    def healthz(self):
-        """Simple health check. This is kept unchanged for the existing tests."""
-        self.respond_text(200, "ok")
-
-    def readyz(self):
-        """Readiness check. Fail it when shutdown has started."""
-        if SHUTTING_DOWN:
-            self.respond_text(503, "shutting down")
+            block_group = parsed.path.split("/")[-1].strip()
+            self.handle_delete_network_policy(block_group)
             return
 
+        self.send_error(404)
+
+    def handle_readyz(self):
+        """Return API server readiness by calling the Kubernetes version endpoint."""
         try:
-            api_client = client.ApiClient()
-            get_kubernetes_version(api_client)
-            self.respond_text(200, "ready")
+            version = get_kubernetes_version(get_api_client())
+            self.respond_json(200, {"status": "ok", "kubernetesVersion": version})
         except Exception as exc:
-            self.respond_json(503, {"ready": False, "error": str(exc)})
+            self.respond_json(503, {"status": "error", "error": str(exc)})
 
-    def deployments_health(self):
-        """Return whether deployments have the requested healthy replicas."""
+    def handle_deployments_health(self):
+        """List deployment health for all namespaces."""
         try:
-            result = get_deployments_health()
-            self.respond_json(200, result)
+            data = get_deployments_health()
+            status_code = 200 if data["unhealthyDeployments"] == 0 else 503
+            self.respond_json(status_code, data)
         except Exception as exc:
-            self.respond_json(500, {"error": str(exc)})
+            self.respond_json(500, {"status": "error", "error": str(exc)})
 
-    def list_network_policies(self, query_string):
-        """List Calico network policies. Can filter only tool-managed ones."""
+    def handle_list_network_policies(self, managed_only=False):
+        """List Calico network policies."""
         try:
-            params = parse_qs(query_string)
-            managed_only = params.get("managed_only", ["false"])[0].lower() == "true"
-
-            result = list_calico_network_policies(managed_only=managed_only)
-            self.respond_json(200, result)
+            items = list_network_policies(managed_only=managed_only)
+            self.respond_json(200, {"count": len(items), "items": items})
         except Exception as exc:
-            self.respond_json(500, {"error": str(exc)})
+            self.respond_json(500, {"status": "error", "error": str(exc)})
 
-    def create_network_policies(self):
-        """
-        Create a bidirectional block between two workloads.
-
-        Expected JSON:
-        {
-          "name": "team-a-to-team-b",
-          "sourceNamespace": "team-a",
-          "sourceLabels": {"app": "api-a"},
-          "targetNamespace": "team-b",
-          "targetLabels": {"app": "api-b"}
-        }
-        """
+    def handle_create_network_policy(self):
+        """Create a bidirectional deny policy pair."""
         try:
-            body = self.read_json_body()
-
-            validate_create_request(body)
-
-            block_name = body["name"]
-            source_namespace = body["sourceNamespace"]
-            source_labels = body["sourceLabels"]
-            target_namespace = body["targetNamespace"]
-            target_labels = body["targetLabels"]
-
-            source_selector = labels_to_calico_selector(source_labels)
-            target_selector = labels_to_calico_selector(target_labels)
-
-            # One policy in source namespace denying traffic to/from target
-            source_policy_name = f"{block_name}-source"
-            source_policy = build_bidirectional_block_policy(
-                name=source_policy_name,
-                namespace=source_namespace,
-                local_selector=source_selector,
-                remote_namespace=target_namespace,
-                remote_selector=target_selector,
-                block_name=block_name,
-            )
-
-            # One policy in target namespace denying traffic to/from source
-            target_policy_name = f"{block_name}-target"
-            target_policy = build_bidirectional_block_policy(
-                name=target_policy_name,
-                namespace=target_namespace,
-                local_selector=target_selector,
-                remote_namespace=source_namespace,
-                remote_selector=source_selector,
-                block_name=block_name,
-            )
-
-            create_calico_network_policy(source_namespace, source_policy)
-            create_calico_network_policy(target_namespace, target_policy)
-
-            self.respond_json(
-                201,
-                {
-                    "message": "bidirectional block created",
-                    "blockName": block_name,
-                    "policies": [
-                        {"name": source_policy_name, "namespace": source_namespace},
-                        {"name": target_policy_name, "namespace": target_namespace},
-                    ],
-                },
-            )
+            payload = read_json_body(self)
+            validate_create_request(payload)
+            result = create_bidirectional_block(payload)
+            self.respond_json(201, result)
         except ValueError as exc:
-            self.respond_json(400, {"error": str(exc)})
-        except ApiException as exc:
-            self.respond_json(500, {"error": format_api_exception(exc)})
+            self.respond_json(400, {"status": "error", "error": str(exc)})
         except Exception as exc:
-            self.respond_json(500, {"error": str(exc)})
+            self.respond_json(500, {"status": "error", "error": str(exc)})
 
-    def delete_network_policies(self, block_name):
-        """Delete both policies created for a block name."""
+    def handle_delete_network_policy(self, block_group):
+        """Delete the managed policy pair by block group name."""
         try:
-            deleted = delete_managed_block_policies(block_name)
-            self.respond_json(
-                200,
-                {
-                    "message": "delete completed",
-                    "blockName": block_name,
-                    "deleted": deleted,
-                },
-            )
-        except ApiException as exc:
-            self.respond_json(500, {"error": format_api_exception(exc)})
+            if not block_group:
+                raise ValueError("block group name is required")
+            result = delete_bidirectional_block(block_group)
+            self.respond_json(200, result)
+        except ValueError as exc:
+            self.respond_json(400, {"status": "error", "error": str(exc)})
         except Exception as exc:
-            self.respond_json(500, {"error": str(exc)})
-
-    def read_json_body(self):
-        """Read JSON from the request body."""
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length).decode("utf-8")
-
-        if not raw_body:
-            raise ValueError("request body is empty")
-
-        try:
-            return json.loads(raw_body)
-        except json.JSONDecodeError:
-            raise ValueError("request body must be valid JSON")
+            self.respond_json(500, {"status": "error", "error": str(exc)})
 
     def respond_text(self, status: int, content: str):
-        """Return plain text."""
+        """Write a plain text response."""
         self.send_response(status)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(bytes(content, "utf-8"))
+        self.wfile.write(content.encode("utf-8"))
 
-    def respond_json(self, status: int, content):
-        """Return JSON response."""
-        body = json.dumps(content, indent=2)
+    def respond_json(self, status: int, payload):
+        """Write a JSON response."""
+        body = json.dumps(payload, indent=2, sort_keys=True)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(bytes(body, "utf-8"))
+        self.wfile.write(body.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        """Keep local runs quieter."""
+        return
+
+
+def get_api_client() -> client.ApiClient:
+    """Return the configured Kubernetes API client."""
+    if API_CLIENT is None:
+        raise RuntimeError("kubernetes client is not configured")
+    return API_CLIENT
+
 
 
 def get_kubernetes_version(api_client: client.ApiClient) -> str:
-    """Get the Kubernetes version from the API server."""
+    """Return the Kubernetes git version string."""
     version = client.VersionApi(api_client).get_code()
     return version.git_version
 
 
-def get_deployments_health():
-    """
-    Check whether deployments have as many healthy pods as requested.
 
-    We use ready_replicas as the simple signal for healthy replicas.
-    """
-    apps_api = client.AppsV1Api()
+def get_deployments_health():
+    """Return health information for deployments across the cluster."""
+    apps_api = client.AppsV1Api(get_api_client())
     deployments = apps_api.list_deployment_for_all_namespaces().items
 
     items = []
-    all_healthy = True
+    unhealthy = 0
 
     for deployment in deployments:
         requested = deployment.spec.replicas or 0
         ready = deployment.status.ready_replicas or 0
-        healthy = ready == requested
+        available = deployment.status.available_replicas or 0
+        healthy = ready >= requested and available >= requested
 
         if not healthy:
-            all_healthy = False
+            unhealthy += 1
 
         items.append(
             {
@@ -242,88 +177,174 @@ def get_deployments_health():
                 "name": deployment.metadata.name,
                 "requestedReplicas": requested,
                 "readyReplicas": ready,
+                "availableReplicas": available,
                 "healthy": healthy,
             }
         )
 
     return {
-        "healthy": all_healthy,
-        "deployments": items,
+        "status": "ok" if unhealthy == 0 else "degraded",
+        "totalDeployments": len(items),
+        "unhealthyDeployments": unhealthy,
+        "items": items,
     }
 
 
-def labels_to_calico_selector(labels):
-    """
-    Turn a simple label map into a Calico selector string.
 
-    Example:
-    {"app": "api-a", "tier": "backend"}
-    becomes
-    "app == 'api-a' && tier == 'backend'"
-    """
-    if not isinstance(labels, dict) or not labels:
-        raise ValueError("labels must be a non-empty object")
+def list_network_policies(managed_only=False):
+    """List Calico network policies from the cluster."""
+    custom_api = client.CustomObjectsApi(get_api_client())
+    response = custom_api.list_cluster_custom_object(
+        group=CALICO_GROUP,
+        version=CALICO_VERSION,
+        plural=CALICO_PLURAL,
+    )
 
-    parts = []
+    items = []
+    for item in response.get("items", []):
+        labels = item.get("metadata", {}).get("labels", {})
+        if managed_only and labels.get(MANAGED_BY_LABEL) != MANAGED_BY_VALUE:
+            continue
 
-    for key in sorted(labels.keys()):
-        value = labels[key]
+        items.append(
+            {
+                "namespace": item.get("metadata", {}).get("namespace"),
+                "name": item.get("metadata", {}).get("name"),
+                "managed": labels.get(MANAGED_BY_LABEL) == MANAGED_BY_VALUE,
+                "blockGroup": labels.get(BLOCK_GROUP_LABEL, ""),
+                "selector": item.get("spec", {}).get("selector", ""),
+                "types": item.get("spec", {}).get("types", []),
+            }
+        )
 
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError("label keys must be non-empty strings")
-
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("label values must be non-empty strings")
-
-        safe_value = value.replace("'", "\\'")
-        parts.append(f"{key} == '{safe_value}'")
-
-    return " && ".join(parts)
-
-
-def build_namespace_selector(namespace):
-    """
-    Build a namespace selector for Calico.
-
-    This uses the common Calico namespace label.
-    """
-    safe_namespace = namespace.replace("'", "\\'")
-    return f"projectcalico.org/name == '{safe_namespace}'"
+    return sorted(items, key=lambda x: ((x["namespace"] or ""), x["name"] or ""))
 
 
-def build_bidirectional_block_policy(
-    name,
-    namespace,
-    local_selector,
-    remote_namespace,
-    remote_selector,
-    block_name,
-):
-    """
-    Build one Calico policy.
 
-    This policy applies to local pods in one namespace and denies traffic
-    to and from the remote workload.
-    """
+def create_bidirectional_block(payload):
+    """Create two Calico policies so traffic is blocked in both directions."""
+    block_group = sanitize_name(payload["name"])
+    source_namespace = payload["sourceNamespace"]
+    target_namespace = payload["targetNamespace"]
+    source_selector = payload["sourceSelector"]
+    target_selector = payload["targetSelector"]
+
+    custom_api = client.CustomObjectsApi(get_api_client())
+
+    source_policy_name = f"{block_group}-source"
+    target_policy_name = f"{block_group}-target"
+
+    source_body = build_policy_body(
+        namespace=source_namespace,
+        policy_name=source_policy_name,
+        block_group=block_group,
+        local_selector=source_selector,
+        remote_namespace=target_namespace,
+        remote_selector=target_selector,
+    )
+    target_body = build_policy_body(
+        namespace=target_namespace,
+        policy_name=target_policy_name,
+        block_group=block_group,
+        local_selector=target_selector,
+        remote_namespace=source_namespace,
+        remote_selector=source_selector,
+    )
+
+    created = []
+    try:
+        created.append(
+            custom_api.create_namespaced_custom_object(
+                group=CALICO_GROUP,
+                version=CALICO_VERSION,
+                namespace=source_namespace,
+                plural=CALICO_PLURAL,
+                body=source_body,
+            )
+        )
+        created.append(
+            custom_api.create_namespaced_custom_object(
+                group=CALICO_GROUP,
+                version=CALICO_VERSION,
+                namespace=target_namespace,
+                plural=CALICO_PLURAL,
+                body=target_body,
+            )
+        )
+    except Exception:
+        for item in created:
+            metadata = item.get("metadata", {})
+            try:
+                custom_api.delete_namespaced_custom_object(
+                    group=CALICO_GROUP,
+                    version=CALICO_VERSION,
+                    namespace=metadata.get("namespace"),
+                    plural=CALICO_PLURAL,
+                    name=metadata.get("name"),
+                )
+            except Exception:
+                pass
+        raise
+
+    return {
+        "status": "created",
+        "blockGroup": block_group,
+        "policies": [
+            {"namespace": source_namespace, "name": source_policy_name},
+            {"namespace": target_namespace, "name": target_policy_name},
+        ],
+    }
+
+
+
+def delete_bidirectional_block(block_group):
+    """Delete all managed policies that belong to one block group."""
+    custom_api = client.CustomObjectsApi(get_api_client())
+    items = list_network_policies(managed_only=True)
+
+    deleted = []
+    for item in items:
+        if item["blockGroup"] != block_group:
+            continue
+
+        custom_api.delete_namespaced_custom_object(
+            group=CALICO_GROUP,
+            version=CALICO_VERSION,
+            namespace=item["namespace"],
+            plural=CALICO_PLURAL,
+            name=item["name"],
+        )
+        deleted.append({"namespace": item["namespace"], "name": item["name"]})
+
+    if not deleted:
+        raise ValueError(f"no managed policies found for block group '{block_group}'")
+
+    return {"status": "deleted", "blockGroup": block_group, "policies": deleted}
+
+
+
+def build_policy_body(namespace, policy_name, block_group, local_selector, remote_namespace, remote_selector):
+    """Build one Calico namespaced policy with deny ingress and egress rules."""
     return {
         "apiVersion": f"{CALICO_GROUP}/{CALICO_VERSION}",
-        "kind": CALICO_KIND,
+        "kind": "NetworkPolicy",
         "metadata": {
-            "name": name,
+            "name": policy_name,
             "namespace": namespace,
             "labels": {
-                MANAGED_BY_LABEL_KEY: MANAGED_BY_LABEL_VALUE,
-                BLOCK_NAME_LABEL_KEY: block_name,
+                MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+                BLOCK_GROUP_LABEL: block_group,
             },
         },
         "spec": {
+            "order": 100.0,
             "selector": local_selector,
             "types": ["Ingress", "Egress"],
             "ingress": [
                 {
                     "action": "Deny",
                     "source": {
-                        "namespaceSelector": build_namespace_selector(remote_namespace),
+                        "namespaceSelector": f"projectcalico.org/name == '{remote_namespace}'",
                         "selector": remote_selector,
                     },
                 }
@@ -332,7 +353,7 @@ def build_bidirectional_block_policy(
                 {
                     "action": "Deny",
                     "destination": {
-                        "namespaceSelector": build_namespace_selector(remote_namespace),
+                        "namespaceSelector": f"projectcalico.org/name == '{remote_namespace}'",
                         "selector": remote_selector,
                     },
                 }
@@ -341,152 +362,53 @@ def build_bidirectional_block_policy(
     }
 
 
-def get_custom_objects_api():
-    """Create a CustomObjectsApi client."""
-    return client.CustomObjectsApi()
+
+def validate_create_request(payload):
+    """Check the required request fields."""
+    required = ["name", "sourceNamespace", "sourceSelector", "targetNamespace", "targetSelector"]
+    for key in required:
+        if key not in payload or not str(payload[key]).strip():
+            raise ValueError(f"'{key}' is required")
 
 
-def create_calico_network_policy(namespace, body):
-    """Create one Calico NetworkPolicy in a namespace."""
-    custom_api = get_custom_objects_api()
 
-    return custom_api.create_namespaced_custom_object(
-        group=CALICO_GROUP,
-        version=CALICO_VERSION,
-        namespace=namespace,
-        plural=CALICO_PLURAL,
-        body=body,
-    )
+def read_json_body(handler):
+    """Read and parse a JSON request body."""
+    content_length = int(handler.headers.get("Content-Length", 0))
+    if content_length <= 0:
+        raise ValueError("request body is required")
 
-
-def list_calico_network_policies(managed_only=False):
-    """List Calico network policies across the cluster."""
-    custom_api = get_custom_objects_api()
-
-    result = custom_api.list_cluster_custom_object(
-        group=CALICO_GROUP,
-        version=CALICO_VERSION,
-        plural=CALICO_PLURAL,
-    )
-
-    items = result.get("items", [])
-    response_items = []
-
-    for item in items:
-        metadata = item.get("metadata", {})
-        labels = metadata.get("labels", {})
-
-        managed = labels.get(MANAGED_BY_LABEL_KEY) == MANAGED_BY_LABEL_VALUE
-        if managed_only and not managed:
-            continue
-
-        response_items.append(
-            {
-                "name": metadata.get("name"),
-                "namespace": metadata.get("namespace"),
-                "managed": managed,
-                "blockName": labels.get(BLOCK_NAME_LABEL_KEY),
-            }
-        )
-
-    response_items.sort(key=lambda x: (x.get("namespace") or "", x.get("name") or ""))
-
-    return {
-        "items": response_items,
-        "count": len(response_items),
-    }
+    raw_body = handler.rfile.read(content_length).decode("utf-8")
+    try:
+        return json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON body: {exc}") from exc
 
 
-def delete_managed_block_policies(block_name):
-    """Delete policies created by this tool for one block name."""
-    custom_api = get_custom_objects_api()
-    all_items = list_calico_network_policies(managed_only=True)["items"]
 
-    deleted = []
+def sanitize_name(value):
+    """Convert a free-form name into a Kubernetes-friendly object name."""
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9-]", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    if not value:
+        raise ValueError("name must contain letters or numbers")
+    return value[:50]
 
-    for item in all_items:
-        if item.get("blockName") != block_name:
-            continue
-
-        namespace = item["namespace"]
-        name = item["name"]
-
-        custom_api.delete_namespaced_custom_object(
-            group=CALICO_GROUP,
-            version=CALICO_VERSION,
-            namespace=namespace,
-            plural=CALICO_PLURAL,
-            name=name,
-        )
-
-        deleted.append({"name": name, "namespace": namespace})
-
-    return deleted
-
-
-def validate_create_request(body):
-    """Validate the POST payload for creating a block."""
-    required_fields = [
-        "name",
-        "sourceNamespace",
-        "sourceLabels",
-        "targetNamespace",
-        "targetLabels",
-    ]
-
-    if not isinstance(body, dict):
-        raise ValueError("request body must be a JSON object")
-
-    for field in required_fields:
-        if field not in body:
-            raise ValueError(f"missing required field: {field}")
-
-    if not isinstance(body["name"], str) or not body["name"].strip():
-        raise ValueError("name must be a non-empty string")
-
-    if not isinstance(body["sourceNamespace"], str) or not body["sourceNamespace"].strip():
-        raise ValueError("sourceNamespace must be a non-empty string")
-
-    if not isinstance(body["targetNamespace"], str) or not body["targetNamespace"].strip():
-        raise ValueError("targetNamespace must be a non-empty string")
-
-    if body["sourceNamespace"] == body["targetNamespace"]:
-        raise ValueError("sourceNamespace and targetNamespace must be different")
-
-    labels_to_calico_selector(body["sourceLabels"])
-    labels_to_calico_selector(body["targetLabels"])
-
-
-def format_api_exception(exc):
-    """Return a cleaner API error message."""
-    return f"{exc.status} {exc.reason}: {exc.body}"
 
 
 def start_server(address):
-    """
-    Start the HTTP server.
-
-    Address should look like:
-    - :8080
-    - 0.0.0.0:8080
-    - 127.0.0.1:8080
-    """
+    """Start the HTTP server and block until interrupted."""
     try:
-        host, port = address.split(":")
-        port = int(port)
+        host, port = address.split(":", 1)
     except ValueError:
-        print("invalid server address format")
+        print("invalid server address format, use host:port")
         return
 
-    class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
-        allow_reuse_address = True
+    server_class = socketserver.ThreadingTCPServer
+    server_class.allow_reuse_address = True
 
-    with ReusableThreadingTCPServer((host, port), AppHandler) as httpd:
+    with server_class((host, int(port)), AppHandler) as httpd:
         print(f"Server listening on {address}")
         httpd.serve_forever()
 
-
-def set_shutting_down():
-    """Mark the app as shutting down so readiness fails."""
-    global SHUTTING_DOWN
-    SHUTTING_DOWN = True
