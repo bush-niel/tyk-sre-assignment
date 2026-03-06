@@ -84,3 +84,6 @@ The tool labels every policy it creates with:
 That makes it possible to:
 - list only tool-managed policies
 - avoid deleting policies owned by another team or platform component
+
+
+[Link to testing the setup](docs/examples/README.md)
