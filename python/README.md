@@ -85,5 +85,5 @@ That makes it possible to:
 - list only tool-managed policies
 - avoid deleting policies owned by another team or platform component
 
-
-[Link to testing the setup](docs/examples/README.md)
+## How to test the application
+[Docs with examples ](docs/examples/README.md)
