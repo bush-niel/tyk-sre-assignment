@@ -27,7 +27,7 @@ python/
 │   ├── __init__.py
 │   └── app.py
 ├── docs/
-│   ├── local-run/README.md
+│   ├── examples/README.md
 ├── helm/
 │   └── tyk-sre-tool/
 │       ├── Chart.yaml
