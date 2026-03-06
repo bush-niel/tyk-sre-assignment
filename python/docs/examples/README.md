@@ -49,22 +49,6 @@ curl "http://127.0.0.1:8080/networkpolicies?managed_only=true" | jq
 ```
 
 
-
-## 4. Build the local Docker image
-
-From the `python/` folder:
-
-```bash
-docker build --platform linux/arm64 -t tyk-sre-tool:local .
-```
-
-If you want Minikube to use the local image without pushing to Docker Hub:
-
-```bash
-minikube image load tyk-sre-tool:local
-```
-
-
 # Testing with app deployed into cluster via helm
 
 ## 1. Deploy the app using helm
