@@ -76,7 +76,7 @@ curl "http://127.0.0.1:8080/networkpolicies?managed_only=true" | jq
 Delete one of the created policies:
 
 ```bash
-curl -X DELETE http://127.0.0.1:8080/networkpolicies/team-a-to-team-b-source-egress | jq
+curl -X DELETE http://127.0.0.1:8080/networkpolicies/team-a-to-team-b | jq
 ```
 
 ## 5. Build the local Docker image
